@@ -9,78 +9,118 @@ import string
 from nltk.stem import WordNetLemmatizer, PorterStemmer
 from nltk.tokenize import word_tokenize
 
-# Download NLTK resources (only needed once)
+# --- NLTK Resource Downloads (Critical for deployment) ---
+# Download resources only if they are not already found, preventing LookupError
 for resource in ['wordnet', 'averaged_perceptron_tagger', 'stopwords', 'punkt']:
     try:
-        nltk.data.find(f'corpora/{resource}' if resource != 'punkt' else 'tokenizers/punkt')
-    except LookupError:
+        # Construct the expected path for nltk.data.find
+        # 'punkt' is a tokenizer, others are corpora
+        path_check = f'corpora/{resource}' if resource != 'punkt' else 'tokenizers/punkt'
+        nltk.data.find(path_check)
+    except nltk.downloader.DownloadError:
+        nltk.download(resource)
+    except LookupError: # Catching the base error for robustness
         nltk.download(resource)
 
+# --- NLP Setup ---
 stop_words = set(stopwords.words('english'))
 lemmatizer = WordNetLemmatizer()
 stemmer = PorterStemmer()
 
 def lemmatize_word(tag):
+    """Converts the POS tag to a format recognized by WordNetLemmatizer."""
     tag = tag[0].lower()
     tag_dict = {"j": wordnet.ADJ, "n": wordnet.NOUN, "v": wordnet.VERB, "r": wordnet.ADV}
     return tag_dict.get(tag, wordnet.NOUN)
 
 def preprocess_text(text):
+    """Performs full preprocessing: cleaning, tokenization, stop word removal, 
+    lemmatization, and stemming."""
+    # 1. Lowercasing and Punctuation removal
     text = text.lower()
     text = text.translate(str.maketrans('', '', string.punctuation))
+    
+    # 2. Tokenization and Stop word removal
     tokens = word_tokenize(text)
     tokens = [word for word in tokens if word not in stop_words]
+    
+    # 3. Lemmatization (requires POS tagging)
     tagged_tokens = nltk.pos_tag(tokens)
     lemmatized_tokens = [lemmatizer.lemmatize(word, lemmatize_word(tag)) for word, tag in tagged_tokens]
+    
+    # 4. Stemming
     stemmed_tokens = [stemmer.stem(word) for word in lemmatized_tokens]
+    
     return " ".join(stemmed_tokens)
 
-# Load the trained model, vectorizer, encoder, and expected column list
-try:
-    model = joblib.load('best_drug_condition_model.pkl')
-    tfidf_vectorizer = joblib.load('tfidf_vectorizer.pkl')
-    label_encoder = joblib.load('label_encoder.pkl')
-    training_columns = joblib.load('training_features.pkl')
+# --- Model Loading ---
+st.cache_resource(show_spinner="Loading Model and Assets...")
+def load_assets():
+    """Loads the model, vectorizer, encoder, and training feature list."""
+    try:
+        model = joblib.load('best_drug_condition_model.pkl')
+        tfidf_vectorizer = joblib.load('tfidf_vectorizer.pkl')
+        label_encoder = joblib.load('label_encoder.pkl')
+        training_columns = joblib.load('training_features.pkl')
 
-    # Remove 'rating' if it's in the training columns (important for alignment later)
-    if 'rating' in training_columns:
-        training_columns.remove('rating')
+        # Remove 'rating' if it was included in feature list during training 
+        # but is not an input feature in the app.
+        if 'rating' in training_columns:
+            training_columns.remove('rating')
+            
+        return model, tfidf_vectorizer, label_encoder, training_columns
 
-except FileNotFoundError as e:
-    st.error(f"Error loading files: {e}. Please ensure all necessary files are in the same directory.")
-    st.stop()
+    except FileNotFoundError as e:
+        st.error(f"Error loading files: {e}. Please ensure **best_drug_condition_model.pkl**, **tfidf_vectorizer.pkl**, **label_encoder.pkl**, and **training_features.pkl** are in the same directory.")
+        # Terminate Streamlit execution gracefully
+        st.stop()
+        
+model, tfidf_vectorizer, label_encoder, training_columns = load_assets()
 
-st.title("Drug Condition Prediction")
+# --- Streamlit UI and Prediction Logic ---
+st.title("💊 Drug Condition Prediction")
+st.markdown("Enter a patient's review and useful count to predict the medical condition.")
 
-review_text = st.text_area("Enter the patient review:", "")
-useful_count = st.number_input("Enter the useful count:", value=0, step=1)
+review_text = st.text_area("Enter the patient review:", "This medicine really helped with my heart ache.")
+useful_count = st.number_input("Enter the useful count:", value=0, min_value=0, step=1)
 
 if st.button("Predict Condition"):
     if review_text and useful_count is not None:
+        
+        # 1. Preprocess the text
         processed_input = preprocess_text(review_text)
 
-        # TF-IDF transformation
+        # 2. TF-IDF transformation
+        # Transform the single processed text into a feature vector
         input_features_text = tfidf_vectorizer.transform([processed_input]).toarray()
-        input_df_text = pd.DataFrame(input_features_text, columns=[str(i) for i in range(input_features_text.shape[1])])
+        
+        # Create a DataFrame for the text features (columns are the vocab index)
+        input_df_text = pd.DataFrame(
+            input_features_text, 
+            columns=[str(i) for i in range(input_features_text.shape[1])]
+        )
 
-        # Other numerical features (only usefulCount now)
-        input_features_other = pd.DataFrame({
-            'usefulCount': [useful_count]
-        })
+        # 3. Other numerical features (UsefulCount)
+        input_features_other = pd.DataFrame({'usefulCount': [useful_count]})
 
-        # Combine all features
-        input_df = pd.concat([input_df_text, input_features_other.reset_index(drop=True)], axis=1)
+        # 4. Combine all features
+        # Ensure indices are reset for proper concatenation
+        input_df = pd.concat([input_df_text.reset_index(drop=True), input_features_other.reset_index(drop=True)], axis=1)
 
-        # Align with training columns
+        # 5. Align with training columns
+        # Fill in missing columns (words not in this review) with 0
         for col in training_columns:
             if col not in input_df.columns:
                 input_df[col] = 0
+        
+        # Select and order the columns exactly as the model was trained
         input_df = input_df[training_columns]
 
-        # Predict
+        # 6. Predict
         prediction_encoded = model.predict(input_df)
         predicted_condition = label_encoder.inverse_transform(prediction_encoded)[0]
-        st.subheader("Predicted Condition:")
-        st.write(predicted_condition)
+        
+        st.subheader("✅ Predicted Condition:")
+        st.success(predicted_condition)
     else:
-        st.warning("Please enter all the required information.")
+        st.warning("⚠️ Please enter a patient review and the useful count to run the prediction.")
